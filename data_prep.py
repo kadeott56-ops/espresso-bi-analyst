@@ -388,3 +388,161 @@ def data_quality_report(result: LoadResult) -> pd.DataFrame:
 
     cols = ["Table", "Check", "Count", "Detail", "Severity"]
     return pd.DataFrame(issues, columns=cols)
+
+
+# ---------------------------------------------------------------------------
+# 6. Joining the tables (Stage 3)
+#
+#    Relationships (verified on the original data):
+#      Stores.ID           1 --< Sales.Store ID      (gives the sales channel)
+#      Categories.Cat. ID  1 --< Sales.Category ID
+#      Products.Product ID 1 --< Sales.Product ID
+#      Survey (store, year) 1 -- 1 store-year revenue table
+#
+#    Rules:
+#      * Every lookup join is a LEFT join from Sales, so no revenue row can be
+#        dropped. Rows with no match get the label "Unknown" and are counted.
+#      * validate="many_to_one" makes pandas stop if a lookup key repeats,
+#        which is exactly the situation that duplicates revenue.
+#      * The survey is joined to revenue summed by store and year, never to
+#        individual Sales rows (different grain).
+# ---------------------------------------------------------------------------
+UNKNOWN = "Unknown"
+
+
+@dataclass
+class Model:
+    sales: pd.DataFrame | None = None        # Sales + store, category, product
+    store_year: pd.DataFrame | None = None   # revenue by store and year + survey
+    merge_log: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def _revenue(df: pd.DataFrame) -> float:
+    return float(df["Revenue"].sum()) if "Revenue" in df.columns else 0.0
+
+
+def check_merge(log: list, name: str, before: pd.DataFrame, after: pd.DataFrame,
+                join: str, unmatched: int = 0, note: str = "") -> None:
+    """Record rows and revenue sum before and after a merge. If either
+    changes, the merge duplicated or dropped data and is marked Error."""
+    rb, ra = len(before), len(after)
+    vb, va = _revenue(before), _revenue(after)
+    ok = rb == ra and round(vb, 2) == round(va, 2)
+    explanation = "Rows and revenue unchanged." if ok else \
+        "Rows or revenue changed: the join duplicated or dropped data."
+    if unmatched:
+        explanation += f" {unmatched:,} rows had no match and are labelled '{UNKNOWN}'."
+    if note:
+        explanation += " " + note
+    log.append({"Merge": name, "Join": join, "Rows before": rb, "Rows after": ra,
+                "Revenue sum before": vb, "Revenue sum after": va,
+                "Status": "OK" if ok else "Error", "Explanation": explanation})
+
+
+def _safe_lookup(lookup: pd.DataFrame, key: str, log: list, label: str) -> pd.DataFrame:
+    """A lookup table must have one row per key. If uploaded data breaks that,
+    keep the first row per key so revenue is not duplicated, and log it."""
+    dups = int(lookup[key].duplicated().sum())
+    if dups:
+        log.append({"Merge": f"Prepare {label}", "Join": "n/a",
+                    "Rows before": len(lookup), "Rows after": len(lookup) - dups,
+                    "Revenue sum before": None, "Revenue sum after": None,
+                    "Status": "Warning",
+                    "Explanation": f"{dups} repeated {key} value(s) in {label}; kept the "
+                                   "first row of each so Sales rows are not duplicated."})
+        lookup = lookup.drop_duplicates(key, keep="first")
+    return lookup
+
+
+def _left_lookup(sales: pd.DataFrame, lookup: pd.DataFrame | None, s_key: str,
+                 l_key: str, cols: list[str], label: str, log: list) -> pd.DataFrame:
+    if lookup is None:
+        out = sales.copy()
+        for c in cols:
+            out[c] = UNKNOWN
+        log.append({"Merge": f"Sales + {label}", "Join": "skipped",
+                    "Rows before": len(sales), "Rows after": len(out),
+                    "Revenue sum before": _revenue(sales), "Revenue sum after": _revenue(out),
+                    "Status": "Warning",
+                    "Explanation": f"{label} table not loaded; columns set to '{UNKNOWN}'."})
+        return out
+    keep = [l_key] + [c for c in cols if c in lookup.columns]
+    lk = _safe_lookup(lookup[keep], l_key, log, label)
+    if l_key != s_key:
+        lk = lk.rename(columns={l_key: s_key})
+    out = sales.merge(lk, on=s_key, how="left", validate="many_to_one", indicator=True)
+    unmatched = int((out["_merge"] == "left_only").sum())
+    out = out.drop(columns="_merge")
+    for c in cols:
+        if c not in out.columns:
+            out[c] = UNKNOWN
+        out[c] = out[c].fillna(UNKNOWN)
+    check_merge(log, f"Sales + {label}", sales, out, f"left, many-to-one on {s_key}",
+                unmatched)
+    return out
+
+
+def build_model(result: LoadResult) -> Model:
+    t = result.tables
+    log: list[dict] = []
+    if "sales" not in t:
+        return Model(merge_log=pd.DataFrame(log))
+
+    sales = t["sales"].drop(columns=["Revenue_raw"], errors="ignore").copy()
+    sales["Year"] = sales["Date"].dt.year.astype("Int64")
+    sales["Month"] = sales["Date"].dt.month.astype("Int64")
+
+    stores = t.get("stores")
+    if stores is not None:
+        stores = stores.copy()
+        # Readable store name for filters and charts, e.g. "SH09 Phoenix, AZ".
+        place = (stores["City"].fillna("") + ", " + stores["State"].fillna("")).str.strip(", ")
+        stores["Store"] = stores["ID"] + " " + place.where(place != "", stores["StoreType"])
+        stores = stores.rename(columns={"StoreType": "Channel"})
+    sales = _left_lookup(sales, stores, "Store ID", "ID",
+                         ["Store", "Channel", "City", "State", "Location", "Market"],
+                         "Stores", log)
+    sales = _left_lookup(sales, t.get("categories"), "Category ID", "Category ID",
+                         ["Category"], "Categories", log)
+    sales = _left_lookup(sales, t.get("products"), "Product ID", "Product ID",
+                         ["Product"], "Products", log)
+    # Product names repeat (three "Base Model" products), so label with the ID.
+    sales["Product label"] = sales["Product ID"].astype(str) + " " + sales["Product"].astype(str)
+
+    # Store-year table: sum revenue first, THEN join the survey 1:1.
+    sy = (sales.dropna(subset=["Year"])
+          .groupby(["Store ID", "Store", "Channel", "Year"], as_index=False)["Revenue"].sum())
+    survey = t.get("survey")
+    if survey is not None:
+        sv = survey[["Store ID", "Year", "Satisfaction", "Interest"]].dropna(subset=["Year"])
+        dups = int(sv.duplicated(["Store ID", "Year"]).sum())
+        if dups:
+            sv = sv.drop_duplicates(["Store ID", "Year"], keep="first")
+        joined = sy.merge(sv, on=["Store ID", "Year"], how="left",
+                          validate="one_to_one", indicator=True)
+        no_score = int((joined["_merge"] == "left_only").sum())
+        joined = joined.drop(columns="_merge")
+        missing_scores = int(joined["Satisfaction"].isna().sum())
+        note = (f"Joined at store-year grain, not to individual Sales rows. "
+                f"{missing_scores} store-years have no Satisfaction score.")
+        if dups:
+            note += f" {dups} repeated survey store-years were dropped."
+        check_merge(log, "Store-year revenue + Survey", sy, joined,
+                    "left, one-to-one on Store ID + Year", no_score, note)
+        sy = joined
+    else:
+        sy["Satisfaction"] = pd.NA
+        sy["Interest"] = pd.NA
+
+    # Final reconciliation: the enriched table must still equal raw Sales.
+    raw = t["sales"]
+    log.append({"Merge": "Final check: enriched Sales vs raw Sales", "Join": "n/a",
+                "Rows before": len(raw), "Rows after": len(sales),
+                "Revenue sum before": _revenue(raw), "Revenue sum after": _revenue(sales),
+                "Status": "OK" if len(raw) == len(sales)
+                and round(_revenue(raw), 2) == round(_revenue(sales), 2) else "Error",
+                "Explanation": "Revenue in the dashboard table equals revenue in the "
+                               "uploaded Sales file."})
+    cols = ["Merge", "Join", "Rows before", "Rows after", "Revenue sum before",
+            "Revenue sum after", "Status", "Explanation"]
+    return Model(sales=sales, store_year=sy, merge_log=pd.DataFrame(log, columns=cols))

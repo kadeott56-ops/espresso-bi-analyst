@@ -85,6 +85,28 @@ st.caption("What one row of each table represents. Row counts are calculated "
            "from the loaded files.")
 st.dataframe(dp.grain_table(result), hide_index=True, use_container_width=True)
 
+st.markdown("#### Table relationships and merge checks")
+model = dp.build_model(result)
+st.markdown(
+    "- **Stores → Sales** on `Store ID` (one store, many sales rows). Gives the sales channel.\n"
+    "- **Categories → Sales** on `Category ID` (one category, many rows).\n"
+    "- **Products → Sales** on `Product ID` (one product, many rows).\n"
+    "- **Survey → store-year revenue** on `Store ID` + `Year` (one to one). The survey is "
+    "joined *after* revenue is summed by store and year, never to individual sales rows.\n\n"
+    "All lookups are left joins, so no revenue row can be dropped. Rows and revenue are "
+    "recorded before and after every merge.")
+if model.merge_log.empty:
+    st.info("Load the Sales table to build the data model.")
+else:
+    bad = model.merge_log["Status"].eq("Error").sum()
+    (st.error if bad else st.success)(
+        f"{bad} merge(s) changed rows or revenue." if bad
+        else "Every merge kept the same rows and revenue.")
+    st.dataframe(model.merge_log, hide_index=True, use_container_width=True,
+                 column_config={
+                     "Revenue sum before": st.column_config.NumberColumn(format="$%,.2f"),
+                     "Revenue sum after": st.column_config.NumberColumn(format="$%,.2f")})
+
 st.markdown("#### Data quality")
 dq = dp.data_quality_report(result)
 if dq.empty:
