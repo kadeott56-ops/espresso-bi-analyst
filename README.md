@@ -12,8 +12,36 @@ _URL here. Note that the app may take a moment to wake up._
 _Upload files, use filters, ask the assistant. Include the file names and sheets it expects._
 
 ## Data model
-_Grain of each table, keys, and how they are joined. Include your merge checks._
+### Source tables and grain
 
+| Table | Source file / sheet | One row = | Key column(s) | Row count | Contains revenue? |
+|---|---|---|---|---|---|
+| Sales | Sales.csv, exported from Support_EX_B_Sales.accdb | Revenue for one store and one product in one month (Date = last day of the month) | Sales ID; also unique on Store ID + Product ID + month | 25,200 | Yes (Revenue) |
+| Categories | Categories.csv, exported from Support_EX_B_Sales.accdb | One product category | Category ID | 5 | No |
+| Products | Products.csv, exported from Support_EX_B_Sales.accdb | One product | Product ID | 20 | No |
+| Stores | Support_EX_B_Stores.csv (tab separated) | One store or sales channel; SH00 is the Website | ID | 21 | No |
+| Survey Results | Support_EX_B_Survey.xlsx, sheet "Survey Results" | One store in one year | Survey ID (matches StoreYear in Sales) | 105 | No |
+
+Row counts are for the original E-Presso data. The app recalculates them from whatever files are uploaded.
+
+### How the Access tables were exported
+
+The Sales, Categories, and Products tables were exported from the Access database on a Mac with mdbtools:
+
+    mdb-export Support_EX_B_Sales.accdb Sales > Sales.csv
+    mdb-export Support_EX_B_Sales.accdb Categories > Categories.csv
+    mdb-export Support_EX_B_Sales.accdb Products > Products.csv
+
+### Data quality findings (original data)
+
+- Sales has one row for every store, product, and month: 21 stores × 20 products × 60 months = 25,200. These are monthly totals, not individual transactions.
+- Feb 2028 rows are dated the 28th, although 2028 is a leap year. Monthly totals are unaffected.
+- Products P11, P15, and P19 are all named "Base Model." The app groups by Product ID, not name.
+- Products has no Category ID column. Category is assigned through Sales.Category ID; each product maps to exactly one category.
+- SH00 (Website) has no city, state, or postal code, and no survey scores. This is structural: there is no store visit to survey.
+- SH01 and SH08 are both in Orlando, FL but are labeled South and East.
+- SH07 (Flushing, NY) has Location = "Southwest," which appears to be a mislabel.
+- SH11's phone number is malformed.
 ## Metric definitions
 _What "revenue" means here, and anything it does not mean._
 
