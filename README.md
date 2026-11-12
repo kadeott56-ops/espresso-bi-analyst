@@ -42,6 +42,20 @@ The Sales, Categories, and Products tables were exported from the Access databas
 - SH01 and SH08 are both in Orlando, FL but are labeled South and East.
 - SH07 (Flushing, NY) has Location = "Southwest," which appears to be a mislabel.
 - SH11's phone number is malformed.
+
+### Table relationships and merge checks
+
+| Merge | Join | Rows before | Rows after | Revenue sum before | Revenue sum after | Explanation |
+|---|---|---|---|---|---|---|
+| Sales + Stores | left, many-to-one on Store ID | 25,200 | 25,200 | $42,174,440 | $42,174,440 | Unchanged; every Store ID matched a store |
+| Sales + Categories | left, many-to-one on Category ID | 25,200 | 25,200 | $42,174,440 | $42,174,440 | Unchanged; every Category ID matched |
+| Sales + Products | left, many-to-one on Product ID | 25,200 | 25,200 | $42,174,440 | $42,174,440 | Unchanged; every Product ID matched |
+| Store-year revenue + Survey | left, one-to-one on Store ID + Year | 105 | 105 | $42,174,440 | $42,174,440 | Survey joined after revenue was summed by store and year; 5 Website store-years have no score |
+
+Numbers are for the original E-Presso data. The app recalculates this table from whatever files are uploaded. 
+
+When I tested joining the survey to Sales on Store ID alone, the row count jumped from 25,200 to 126,000 and revenue from $42,174,440 to $210,872,200, five times the actual total. This happened because each store has one survey row per year for five years, so every sales row was matched five times. To fix this, the app sums revenue by store and year first, then joins the survey one to one.
+
 ## Metric definitions
 _What "revenue" means here, and anything it does not mean._
 
