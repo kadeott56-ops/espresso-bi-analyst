@@ -101,3 +101,50 @@ def test_missing_table_is_reported_not_crashing():
 def test_unrecognised_file_gives_plain_message():
     r = dp.load_files({"junk.csv": b"a,b\n1,2\n"})
     assert any("did not match" in m for m in r.messages)
+
+
+# ---------------- Stage 3: joins ----------------
+def test_joins_keep_rows_and_revenue():
+    m = dp.build_model(_load())
+    # By hand: 5 sales rows; revenue 360.5 ("abc" is blank, not dropped).
+    assert len(m.sales) == 5
+    assert m.sales["Revenue"].sum() == 360.5
+    assert set(m.merge_log["Status"]) <= {"OK", "Warning"}  # no Error
+
+
+def test_unmatched_store_is_labelled_not_dropped():
+    m = dp.build_model(_load())
+    row = m.sales[m.sales["Store ID"] == "SH99"].iloc[0]
+    assert row["Channel"] == dp.UNKNOWN and row["Revenue"] == 10
+
+
+def test_channel_totals_add_up():
+    m = dp.build_model(_load())
+    by_ch = m.sales.groupby("Channel")["Revenue"].sum().to_dict()
+    # Website SH00 = 100; Brick & Mortar SH01+SH02 = 200.5 + 50; Unknown SH99 = 10
+    assert by_ch == {"Website": 100, "Brick & Mortar": 250.5, dp.UNKNOWN: 10}
+
+
+def test_duplicate_lookup_key_does_not_duplicate_revenue():
+    cats = pd.concat([CATS, CATS.iloc[[0]]])          # C1 appears twice
+    r = _load()
+    r.tables["categories"] = cats
+    m = dp.build_model(r)
+    assert m.sales["Revenue"].sum() == 360.5          # not inflated
+    assert "Warning" in set(m.merge_log["Status"])
+
+
+def test_survey_joined_at_store_year_grain():
+    m = dp.build_model(_load())
+    sy = m.store_year
+    # SH01 has two sales rows but in different years -> two store-years.
+    assert len(sy[sy["Store ID"] == "SH01"]) == 2
+    sh01_25 = sy[(sy["Store ID"] == "SH01") & (sy["Year"] == 2025)].iloc[0]
+    assert sh01_25["Revenue"] == 200.5 and sh01_25["Satisfaction"] == 4.1
+
+
+def test_model_without_lookups_still_builds():
+    r = dp.load_files({"Sales.xlsx": _xlsx(SALES)})
+    m = dp.build_model(r)
+    assert m.sales["Revenue"].sum() == 360.5
+    assert (m.sales["Channel"] == dp.UNKNOWN).all()
