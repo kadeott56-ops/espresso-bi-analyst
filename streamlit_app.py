@@ -119,9 +119,9 @@ with dash_tab:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total revenue", money(k["total_revenue"]),
                   help="Sum of Revenue for all rows in the current scope.")
-        c2.metric("Website revenue", money(k["website_revenue"]),
-                  f"{k['website_share_pct']:.1f}% of total" if k["website_share_pct"] is not None
-                  else None, delta_color="off")
+        c2.metric("Website revenue", money(k["website_revenue"]))
+        if k["website_share_pct"] is not None:
+            c2.caption(f"{k['website_share_pct']:.1f}% of total revenue in scope")
         c3.metric("Brick & mortar revenue", money(k["store_revenue"]))
         g = k["latest_year_growth_pct"]
         c4.metric(f"{k['latest_year']} revenue", money(k["latest_year_revenue"]),
@@ -142,6 +142,8 @@ with dash_tab:
             fig = px.bar(yc, x="Year", y="Revenue", color="Channel", barmode="group",
                          color_discrete_map=CHANNEL_COLORS,
                          title="Annual revenue by sales channel")
+            # Years are labels, not a continuous number line (avoids "2,026.5").
+            fig.update_xaxes(type="category")
             st.plotly_chart(dollar_axis(fig), use_container_width=True)
 
         # ---- Chart 2: monthly pattern ----
