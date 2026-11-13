@@ -72,7 +72,7 @@ for key, src in result.sources.items():
 for msg in result.messages:
     st.warning(msg)
 
-dash_tab, data_tab = st.tabs(["📊 Dashboard", "🗂️ Data, joins & quality"])
+dash_tab, data_tab = st.tabs(["Dashboard", "Data, joins & quality"])
 
 # ======================= Dashboard tab =======================
 with dash_tab:
