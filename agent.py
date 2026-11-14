@@ -574,7 +574,9 @@ def answer_with_rules(question: str, ctx: Context, opts: dict,
 #    router if there is no key, the API fails, the quota is used up, or the
 #    answer contains a number that is not in any tool result.
 # ---------------------------------------------------------------------------
-DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+# Fastest first. Connection check on Nov 14, 2026: 3.5-flash-lite answered in 0.7 s,
+# 3.6-flash in 18 s, and 3.8-flash timed out (504 DEADLINE_EXCEEDED).
+DEFAULT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
 MAX_MODEL_ROUNDS = 3        # rounds of tool calls per question
 MAX_TOOL_CALLS = 6          # total tool calls per question
 GEMINI_TIMEOUT_MS = 30_000  # one request may take at most 30 seconds
@@ -806,7 +808,7 @@ def _function_response_part(types, fc, result):
 def _is_retryable(exc) -> bool:
     s = str(exc).upper()
     return any(k in s for k in ("404", "NOT_FOUND", "NOT FOUND", "429", "RESOURCE_EXHAUSTED",
-                                "QUOTA", "UNAVAILABLE", "503"))
+                                "QUOTA", "UNAVAILABLE", "503", "504", "DEADLINE_EXCEEDED"))
 
 
 def _short(exc) -> str:
