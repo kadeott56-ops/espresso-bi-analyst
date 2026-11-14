@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import agent as ag
 import analytics as an
 import data_prep as dp
 
@@ -72,7 +73,176 @@ for key, src in result.sources.items():
 for msg in result.messages:
     st.warning(msg)
 
-dash_tab, data_tab = st.tabs(["Dashboard", "Data, joins & quality"])
+# ======================= Sidebar: filters =======================
+# Built before the tabs so both the dashboard and the assistant can use them.
+f_years, f_channels, f_stores, f_cats = [], [], [], []
+opts = {}
+if model.sales is not None:
+    opts = an.filter_options(model.sales)   # choices come from the loaded data
+    st.sidebar.header("2. Filters")
+    st.sidebar.caption("Leave a filter blank to include everything.")
+    f_years = st.sidebar.multiselect("Year", opts["years"], placeholder="All years")
+    f_channels = st.sidebar.multiselect("Sales channel", opts["channels"],
+                                        placeholder="All channels")
+    f_stores = st.sidebar.multiselect("Store", opts["stores"], placeholder="All stores")
+    f_cats = st.sidebar.multiselect("Product category", opts["categories"],
+                                    placeholder="All categories")
+
+
+def chosen(x):  # blank multiselect = no filter
+    return x or None
+
+
+dq_report = dp.data_quality_report(result)
+
+dash_tab, asst_tab, data_tab = st.tabs(["Dashboard", "Assistant", "Data, joins & quality"])
+
+# ======================= Data tab =======================
+with data_tab:
+    sales_raw = result.tables.get("sales")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tables loaded", f"{len(result.tables)} of {len(dp.TABLE_SPECS)}")
+    if sales_raw is not None:
+        c2.metric("Sales rows", f"{len(sales_raw):,}")
+        c3.metric("Revenue (all valid rows)", f"${sales_raw['Revenue'].sum():,.2f}")
+        d = sales_raw["Date"].dropna()
+        c4.metric("Date range", f"{d.min():%b %Y} to {d.max():%b %Y}" if len(d) else "n/a")
+
+    st.markdown("#### Grain statements")
+    st.caption("What one row of each table represents. Row counts are calculated "
+               "from the loaded files.")
+    st.dataframe(dp.grain_table(result), hide_index=True, use_container_width=True)
+
+    st.markdown("#### Table relationships and merge checks")
+    st.markdown(
+        "- **Stores → Sales** on `Store ID` (one store, many sales rows). Gives the sales channel.\n"
+        "- **Categories → Sales** on `Category ID` (one category, many rows).\n"
+        "- **Products → Sales** on `Product ID` (one product, many rows).\n"
+        "- **Survey → store-year revenue** on `Store ID` + `Year` (one to one). The survey is "
+        "joined *after* revenue is summed by store and year, never to individual sales rows.\n\n"
+        "All lookups are left joins, so no revenue row can be dropped. Rows and revenue are "
+        "recorded before and after every merge.")
+    if model.merge_log.empty:
+        st.info("Load the Sales table to build the data model.")
+    else:
+        bad = model.merge_log["Status"].eq("Error").sum()
+        (st.error if bad else st.success)(
+            f"{bad} merge(s) changed rows or revenue." if bad
+            else "Every merge kept the same rows and revenue.")
+        st.dataframe(model.merge_log, hide_index=True, use_container_width=True,
+                     column_config={
+                         "Revenue sum before": st.column_config.NumberColumn(format="$%,.2f"),
+                         "Revenue sum after": st.column_config.NumberColumn(format="$%,.2f")})
+
+    st.markdown("#### Data quality")
+    dq = dq_report
+    if dq.empty:
+        st.success("No data-quality issues found.")
+    else:
+        errors = int((dq["Severity"] == "Error").sum())
+        st.caption(f"{len(dq)} findings, {errors} marked Error. Issues are reported, "
+                   "not silently fixed.")
+        st.dataframe(dq, hide_index=True, use_container_width=True)
+
+    st.markdown("#### Tables")
+    if result.tables:
+        tabs = st.tabs([dp.TABLE_SPECS[k]["label"] for k in result.tables])
+        for tab, (key, df) in zip(tabs, result.tables.items()):
+            with tab:
+                shown = df[[c for c in df.columns if not c.endswith("_raw")]]
+                st.caption(f"{len(shown):,} rows x {shown.shape[1]} columns. "
+                           f"Source: {result.sources[key]}")
+                st.markdown("**Column profile**")
+                st.dataframe(dp.profile_table(df), hide_index=True, use_container_width=True)
+                st.markdown("**First 20 rows**")
+                st.dataframe(shown.head(20), hide_index=True, use_container_width=True)
+
+# ======================= Assistant tab =======================
+EXAMPLES = [
+    "How much revenue did the website generate in 2028?",
+    "Which store experienced the greatest percentage revenue decline?",
+    "Which channel grew faster?",
+    "What share of 2026 revenue came in December?",
+    "Which category sells the most?",
+    "Does higher customer satisfaction cause higher revenue?",
+    "Which E-Presso store is the most profitable?",
+    "Are there any data quality problems?",
+]
+
+with asst_tab:
+    st.markdown("#### Ask the analytical assistant")
+    st.caption(
+        "Mode: **rules-based assistant (Option B)**. It matches your question to one of "
+        "the approved analytical functions, runs that function on the currently loaded "
+        "data, and reports only numbers the function returns. It cannot run other code "
+        "or change the data.")
+    if model.sales is None:
+        st.info("Upload the Sales table to use the assistant.")
+    else:
+        ctx = ag.Context(model.sales, model.store_year, dq_report, model.merge_log)
+        use_filters = st.toggle(
+            "Use sidebar filters as defaults", value=True,
+            help="When a sidebar filter has exactly one value (for example Year = 2027), "
+                 "questions that don't name that item use it. Anything named in the "
+                 "question wins. The scope line shows where each value came from.")
+        defaults, ignored = {}, []
+        if use_filters:
+            for key, sel in (("year", f_years), ("channel", f_channels),
+                             ("store", f_stores), ("category", f_cats)):
+                if len(sel) == 1:
+                    defaults[key] = sel[0]
+                elif len(sel) > 1:
+                    ignored.append(key)
+        if defaults:
+            st.caption("Defaults from sidebar: " + ", ".join(f"{k} = {v}"
+                                                            for k, v in defaults.items()))
+        if ignored:
+            st.caption("Sidebar filters with more than one value are not applied to "
+                       f"questions ({', '.join(ignored)}). Name one in your question instead.")
+
+        with st.expander("What can I ask?"):
+            st.markdown("I can answer questions about: " + "; ".join(ag.CAPABILITIES) + ".")
+            st.markdown("**Examples**\n" + "\n".join(f"- {e}" for e in EXAMPLES))
+
+        if "chat" not in st.session_state:
+            st.session_state.chat = []
+            st.session_state.questions_used = 0
+
+        for msg in st.session_state.chat:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg["role"] == "assistant":
+                    st.caption(msg["meta"])
+                    log = msg["log"]
+                    with st.expander(f"Tool-call log ({len(log)} call"
+                                     f"{'' if len(log) == 1 else 's'})"):
+                        if not log:
+                            st.caption("No function was called for this question.")
+                        for i, call in enumerate(log, 1):
+                            st.markdown(f"**{i}. `{call['tool']}`**")
+                            st.markdown("Arguments")
+                            st.json(call["arguments"])
+                            st.markdown("Raw result")
+                            st.json(call["result"], expanded=False)
+
+        remaining = ag.MAX_QUESTIONS - st.session_state.questions_used
+        if remaining <= 0:
+            st.warning(f"You've reached the limit of {ag.MAX_QUESTIONS} questions for this "
+                       "session. Reload the page to start a new session.")
+        else:
+            st.caption(f"{remaining} of {ag.MAX_QUESTIONS} questions left this session.")
+        question = st.chat_input("Ask a business question about E-Presso",
+                                 disabled=remaining <= 0)
+        if question:
+            st.session_state.questions_used += 1
+            answer, log, plan = ag.answer_with_rules(question, ctx, opts, defaults)
+            sales_src = result.sources.get("sales", "unknown file")
+            st.session_state.chat.append({"role": "user", "content": question})
+            st.session_state.chat.append({
+                "role": "assistant", "content": answer, "log": log,
+                "meta": f"Answered by: rules-based router · Data: {sales_src}"})
+            st.rerun()
+
 
 # ======================= Dashboard tab =======================
 with dash_tab:
@@ -80,20 +250,6 @@ with dash_tab:
         st.info("Upload the Sales table to see the dashboard.")
     else:
         sales = model.sales
-        opts = an.filter_options(sales)
-
-        # ---- Sidebar filters (choices come from the loaded data) ----
-        st.sidebar.header("2. Filters")
-        st.sidebar.caption("Leave a filter blank to include everything.")
-        f_years = st.sidebar.multiselect("Year", opts["years"], placeholder="All years")
-        f_channels = st.sidebar.multiselect("Sales channel", opts["channels"],
-                                            placeholder="All channels")
-        f_stores = st.sidebar.multiselect("Store", opts["stores"], placeholder="All stores")
-        f_cats = st.sidebar.multiselect("Product category", opts["categories"],
-                                        placeholder="All categories")
-
-        def chosen(x):  # blank multiselect = no filter
-            return x or None
 
         filtered = an.filter_sales(sales, chosen(f_years), chosen(f_channels),
                                    chosen(f_stores), chosen(f_cats))
@@ -224,63 +380,3 @@ with dash_tab:
                 + "This shows association only, not that satisfaction causes revenue. "
                   "Each point is one physical store in one year; the Website has no survey "
                   "and is excluded. Revenue reflects the current filters.")
-
-# ======================= Data tab =======================
-with data_tab:
-    sales_raw = result.tables.get("sales")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tables loaded", f"{len(result.tables)} of {len(dp.TABLE_SPECS)}")
-    if sales_raw is not None:
-        c2.metric("Sales rows", f"{len(sales_raw):,}")
-        c3.metric("Revenue (all valid rows)", f"${sales_raw['Revenue'].sum():,.2f}")
-        d = sales_raw["Date"].dropna()
-        c4.metric("Date range", f"{d.min():%b %Y} to {d.max():%b %Y}" if len(d) else "n/a")
-
-    st.markdown("#### Grain statements")
-    st.caption("What one row of each table represents. Row counts are calculated "
-               "from the loaded files.")
-    st.dataframe(dp.grain_table(result), hide_index=True, use_container_width=True)
-
-    st.markdown("#### Table relationships and merge checks")
-    st.markdown(
-        "- **Stores → Sales** on `Store ID` (one store, many sales rows). Gives the sales channel.\n"
-        "- **Categories → Sales** on `Category ID` (one category, many rows).\n"
-        "- **Products → Sales** on `Product ID` (one product, many rows).\n"
-        "- **Survey → store-year revenue** on `Store ID` + `Year` (one to one). The survey is "
-        "joined *after* revenue is summed by store and year, never to individual sales rows.\n\n"
-        "All lookups are left joins, so no revenue row can be dropped. Rows and revenue are "
-        "recorded before and after every merge.")
-    if model.merge_log.empty:
-        st.info("Load the Sales table to build the data model.")
-    else:
-        bad = model.merge_log["Status"].eq("Error").sum()
-        (st.error if bad else st.success)(
-            f"{bad} merge(s) changed rows or revenue." if bad
-            else "Every merge kept the same rows and revenue.")
-        st.dataframe(model.merge_log, hide_index=True, use_container_width=True,
-                     column_config={
-                         "Revenue sum before": st.column_config.NumberColumn(format="$%,.2f"),
-                         "Revenue sum after": st.column_config.NumberColumn(format="$%,.2f")})
-
-    st.markdown("#### Data quality")
-    dq = dp.data_quality_report(result)
-    if dq.empty:
-        st.success("No data-quality issues found.")
-    else:
-        errors = int((dq["Severity"] == "Error").sum())
-        st.caption(f"{len(dq)} findings, {errors} marked Error. Issues are reported, "
-                   "not silently fixed.")
-        st.dataframe(dq, hide_index=True, use_container_width=True)
-
-    st.markdown("#### Tables")
-    if result.tables:
-        tabs = st.tabs([dp.TABLE_SPECS[k]["label"] for k in result.tables])
-        for tab, (key, df) in zip(tabs, result.tables.items()):
-            with tab:
-                shown = df[[c for c in df.columns if not c.endswith("_raw")]]
-                st.caption(f"{len(shown):,} rows x {shown.shape[1]} columns. "
-                           f"Source: {result.sources[key]}")
-                st.markdown("**Column profile**")
-                st.dataframe(dp.profile_table(df), hide_index=True, use_container_width=True)
-                st.markdown("**First 20 rows**")
-                st.dataframe(shown.head(20), hide_index=True, use_container_width=True)

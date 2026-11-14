@@ -313,8 +313,12 @@ def get_revenue_by_year(sales, channel=None, store=None, category=None) -> dict:
     growth = {}
     for y in by.index:
         growth[str(int(y))] = yoy_growth(by[y], by.get(y - 1))
+    first_y, last_y = int(by.index[0]), int(by.index[-1])
     value = {"revenue_by_year": {str(int(y)): float(v) for y, v in by.items()},
-             "yoy_growth_pct": growth}
+             "yoy_growth_pct": growth,
+             "first_year": first_y, "last_year": last_y,
+             "change_first_to_last_pct": yoy_growth(by.iloc[-1], by.iloc[0])
+             if first_y != last_y else None}
     cav = _base_caveats(df)
     partial = [f"{int(y)} ({int(n)} months)" for y, n in months.items() if n < 12]
     if partial:
@@ -370,6 +374,54 @@ def get_store_trend(sales, start_year=None, end_year=None, channel=None, categor
     cav.append("Only the start and end years are compared; changes in between are not shown.")
     return _result(tool, value, definition, scope,
                    df[df["Year"].isin([sy, ey])]["Revenue"].notna().sum(), cav)
+
+
+def get_revenue_by_store(sales, year=None, channel=None, category=None) -> dict:
+    tool = "get_revenue_by_store"
+    definition = ("Sum of Revenue for each store, ranked highest to lowest. "
+                  "Share % = store revenue / total revenue in the scope.")
+    df, scope, err = _scope(sales, year, channel, None, category)
+    scope.pop("store")
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    by = df.groupby(["Store", "Channel"], as_index=False)["Revenue"].sum()
+    by = by.sort_values("Revenue", ascending=False)
+    total = by["Revenue"].sum()
+    value = [{"rank": i + 1, "store": r["Store"], "channel": r["Channel"],
+              "revenue": float(r["Revenue"]),
+              "share_pct": float(r["Revenue"] / total * 100) if total else None}
+             for i, (_, r) in enumerate(by.iterrows())]
+    cav = _base_caveats(df)
+    if channel is None and (by["Channel"] == "Website").any():
+        cav.append("The Website (SH00) is a sales channel, not a physical store; it is "
+                   "ranked here for completeness.")
+    return _result(tool, value, definition, scope, df["Revenue"].notna().sum(), cav)
+
+
+def get_top_products(sales, year=None, channel=None, store=None, category=None,
+                     n: int = 5) -> dict:
+    tool = "get_top_products"
+    definition = ("Sum of Revenue for each product, ranked highest to lowest. Products are "
+                  "identified by Product ID because three products share the name 'Base Model'.")
+    df, scope, err = _scope(sales, year, channel, store, category)
+    try:
+        n = max(1, min(20, int(n)))
+    except (TypeError, ValueError):
+        n = 5
+    scope["top_n"] = n
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    total = df["Revenue"].sum()
+    tp = top_products(df, n)
+    value = [{"rank": i + 1, "product": r["Product label"], "category": r["Category"],
+              "revenue": float(r["Revenue"]),
+              "share_pct": float(r["Revenue"] / total * 100) if total else None}
+             for i, (_, r) in enumerate(tp.iterrows())]
+    return _result(tool, value, definition, scope, df["Revenue"].notna().sum(), _base_caveats(df))
 
 
 def get_category_performance(sales, year=None, channel=None, store=None) -> dict:
