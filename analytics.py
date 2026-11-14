@@ -147,6 +147,323 @@ def correlation(x: pd.Series, y: pd.Series) -> tuple[float | None, int]:
     return float(pairs["x"].corr(pairs["y"])), len(pairs)
 
 
+# ===========================================================================
+# TOOL FUNCTIONS (Stage 6)
+#
+# These are the only functions the analytical assistant may call. Each one:
+#   * takes explicit parameters (never reads the sidebar or other app state),
+#   * checks every parameter against values that exist in the loaded data and
+#     returns an error result for unknown values instead of guessing,
+#   * returns the tool contract: tool, value, definition, scope, rows_used,
+#     caveats (and error, when a parameter is invalid),
+#   * returns plain numbers, strings, lists and dicts so the result can be
+#     shown in the tool-call log and sent to a language model as JSON.
+# ===========================================================================
+REVENUE_NOT_PROFIT = "Revenue is not profit: the data has no costs, so profitability cannot be calculated."
+
+CHANNEL_ALIASES = {
+    "website": "Website", "web": "Website", "online": "Website", "ecommerce": "Website",
+    "e-commerce": "Website", "internet": "Website",
+    "brick & mortar": "Brick & Mortar", "brick and mortar": "Brick & Mortar",
+    "brick-and-mortar": "Brick & Mortar", "stores": "Brick & Mortar", "store": "Brick & Mortar",
+    "physical": "Brick & Mortar", "physical stores": "Brick & Mortar", "in-store": "Brick & Mortar",
+    "retail": "Brick & Mortar",
+}
+
+
+def _plain(x):
+    """Convert numpy/pandas values to plain Python so results are JSON-safe."""
+    if isinstance(x, dict):
+        return {str(k): _plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_plain(v) for v in x]
+    if x is None or (not isinstance(x, str) and pd.isna(x)):
+        return None
+    if hasattr(x, "item"):          # numpy scalar
+        x = x.item()
+    if isinstance(x, float):
+        return round(x, 2)
+    return x
+
+
+def _norm(v) -> str:
+    return str(v).strip().lower()
+
+
+def _resolve(value, options, kind, aliases=None):
+    """Match a requested value to one that exists in the data.
+    Returns (matched_value_or_None, error_or_None). None/'All' means no filter."""
+    if value is None or _norm(value) in ("", "all", "any", "none"):
+        return None, None
+    v = _norm(value)
+    if aliases and v in aliases and aliases[v] in options:
+        return aliases[v], None
+    for o in options:
+        if _norm(o) == v:
+            return o, None
+    partial = [o for o in options if v in _norm(o)]
+    if len(partial) == 1:                 # e.g. "Chicago" or "SH11" -> "SH11 Chicago, IL"
+        return partial[0], None
+    if partial:
+        return None, f"'{value}' matches more than one {kind}: {', '.join(map(str, partial))}."
+    return None, f"Unknown {kind} '{value}'. Available: {', '.join(map(str, options))}."
+
+
+def _resolve_year(value, years):
+    if value is None or _norm(value) in ("", "all", "any", "none"):
+        return None, None
+    try:
+        y = int(str(value).strip().lstrip("Yy"))
+    except ValueError:
+        return None, f"Year must be a number like 2027, not '{value}'."
+    if y not in years:
+        return None, f"No data for year {y}. Available years: {', '.join(map(str, years))}."
+    return y, None
+
+
+def _scope(sales, year=None, channel=None, store=None, category=None):
+    """Validate parameters and filter. Returns (df, scope, error)."""
+    opts = filter_options(sales)
+    y, e1 = _resolve_year(year, opts["years"])
+    c, e2 = _resolve(channel, opts["channels"], "channel", CHANNEL_ALIASES)
+    s, e3 = _resolve(store, opts["stores"], "store")
+    g, e4 = _resolve(category, opts["categories"], "category")
+    scope = {"year": y if y is not None else "All", "channel": c or "All",
+             "store": s or "All", "category": g or "All"}
+    errors = [e for e in (e1, e2, e3, e4) if e]
+    if errors:
+        return None, scope, " ".join(errors)
+    df = filter_sales(sales, [y] if y is not None else None, [c] if c else None,
+                      [s] if s else None, [g] if g else None)
+    return df, scope, None
+
+
+def _base_caveats(df) -> list[str]:
+    cav = [REVENUE_NOT_PROFIT]
+    blank = int(df["Revenue"].isna().sum())
+    if blank:
+        cav.append(f"{blank} rows with blank revenue were excluded.")
+    unknown = int((df.get("Channel", pd.Series(dtype=str)) == "Unknown").sum())
+    if unknown:
+        cav.append(f"{unknown} rows have a store not found in the Stores table (channel 'Unknown').")
+    return cav
+
+
+def _result(tool, value, definition, scope, rows_used, caveats, error=None):
+    out = {"tool": tool, "value": _plain(value), "definition": definition,
+           "scope": _plain(scope), "rows_used": int(rows_used), "caveats": list(caveats)}
+    if error:
+        out["error"] = error
+    return out
+
+
+def _error(tool, scope, msg):
+    return _result(tool, None, "", scope, 0, [], error=msg)
+
+
+def _empty_check(tool, df, scope, definition):
+    if df is None or df.empty or df["Revenue"].notna().sum() == 0:
+        return _result(tool, None, definition, scope, 0,
+                       ["No sales rows match this scope, so there is nothing to calculate."])
+    return None
+
+
+# ---------------------------------------------------------------------------
+def get_total_revenue(sales, year=None, channel=None, store=None, category=None) -> dict:
+    tool = "get_total_revenue"
+    definition = "Sum of Revenue over all sales rows in the scope (one row = one store, one product, one month)."
+    df, scope, err = _scope(sales, year, channel, store, category)
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    return _result(tool, float(df["Revenue"].sum()), definition, scope,
+                   df["Revenue"].notna().sum(), _base_caveats(df))
+
+
+def get_revenue_by_channel(sales, year=None, store=None, category=None) -> dict:
+    tool = "get_revenue_by_channel"
+    definition = ("Sum of Revenue grouped by sales channel (Stores.StoreType). "
+                  "Share % = channel revenue / total revenue in the scope.")
+    df, scope, err = _scope(sales, year, None, store, category)
+    scope.pop("channel")
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    by = df.groupby("Channel")["Revenue"].sum()
+    total = by.sum()
+    value = {ch: {"revenue": float(v), "share_pct": float(v / total * 100) if total else None}
+             for ch, v in by.items()}
+    return _result(tool, value, definition, scope, df["Revenue"].notna().sum(), _base_caveats(df))
+
+
+def get_revenue_by_year(sales, channel=None, store=None, category=None) -> dict:
+    tool = "get_revenue_by_year"
+    definition = ("Sum of Revenue for each calendar year (from the sales Date). "
+                  "YoY growth % = (this year - previous year) / previous year.")
+    df, scope, err = _scope(sales, None, channel, store, category)
+    scope.pop("year")
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    by = df.groupby("Year")["Revenue"].sum().sort_index()
+    months = df.groupby("Year")["Month"].nunique()
+    growth = {}
+    for y in by.index:
+        growth[str(int(y))] = yoy_growth(by[y], by.get(y - 1))
+    value = {"revenue_by_year": {str(int(y)): float(v) for y, v in by.items()},
+             "yoy_growth_pct": growth}
+    cav = _base_caveats(df)
+    partial = [f"{int(y)} ({int(n)} months)" for y, n in months.items() if n < 12]
+    if partial:
+        cav.append("Some years have fewer than 12 months of data, so their totals are not "
+                   "comparable to full years: " + ", ".join(partial) + ".")
+    cav.append("Growth is undefined (null) for the first year because there is no prior year.")
+    return _result(tool, value, definition, scope, df["Revenue"].notna().sum(), cav)
+
+
+def get_store_trend(sales, start_year=None, end_year=None, channel=None, category=None) -> dict:
+    tool = "get_store_trend"
+    definition = ("For each store: revenue in the end year minus revenue in the start year, "
+                  "in dollars and as % of start-year revenue.")
+    opts = filter_options(sales)
+    sy, e1 = _resolve_year(start_year, opts["years"])
+    ey, e2 = _resolve_year(end_year, opts["years"])
+    sy = sy if sy is not None else (opts["years"][0] if opts["years"] else None)
+    ey = ey if ey is not None else (opts["years"][-1] if opts["years"] else None)
+    df, scope, err = _scope(sales, None, channel, None, category)
+    scope.pop("year"); scope.pop("store")
+    scope.update({"start_year": sy, "end_year": ey})
+    err = " ".join(e for e in (e1, e2, err) if e)
+    if err:
+        return _error(tool, scope, err)
+    if sy is None or ey is None or sy >= ey:
+        return _error(tool, scope, "The start year must be earlier than the end year.")
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    piv = (df[df["Year"].isin([sy, ey])].groupby(["Store", "Channel", "Year"])["Revenue"]
+           .sum().unstack("Year"))
+    rows, skipped = [], []
+    for (store, ch), r in piv.iterrows():
+        start, end = r.get(sy), r.get(ey)
+        if pd.isna(start) or pd.isna(end) or start == 0:
+            skipped.append(store)
+            continue
+        rows.append({"store": store, "channel": ch, "start_revenue": float(start),
+                     "end_revenue": float(end), "change": float(end - start),
+                     "change_pct": float((end - start) / start * 100)})
+    rows.sort(key=lambda d: d["change_pct"])
+    declining = [r for r in rows if r["change"] < 0]
+    value = {"stores": rows,
+             "stores_declining": len(declining),
+             "stores_growing": len([r for r in rows if r["change"] > 0]),
+             "largest_pct_decline": declining[0] if declining else None,
+             "largest_pct_growth": rows[-1] if rows and rows[-1]["change"] > 0 else None}
+    cav = _base_caveats(df)
+    if not declining:
+        cav.append(f"No store declined between {sy} and {ey}, so there is no 'greatest decline'.")
+    if skipped:
+        cav.append("Excluded because they have no revenue in the start or end year: "
+                   + ", ".join(skipped) + ".")
+    cav.append("Only the start and end years are compared; changes in between are not shown.")
+    return _result(tool, value, definition, scope,
+                   df[df["Year"].isin([sy, ey])]["Revenue"].notna().sum(), cav)
+
+
+def get_category_performance(sales, year=None, channel=None, store=None) -> dict:
+    tool = "get_category_performance"
+    definition = ("Sum of Revenue for each product category (Sales.Category ID joined to "
+                  "Categories). Share % = category revenue / total revenue in the scope.")
+    df, scope, err = _scope(sales, year, channel, store, None)
+    scope.pop("category")
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    cat = revenue_by_category(df)
+    value = [{"category": r["Category"], "revenue": float(r["Revenue"]),
+              "share_pct": float(r["Share %"])} for _, r in cat.iterrows()]
+    return _result(tool, value, definition, scope, df["Revenue"].notna().sum(), _base_caveats(df))
+
+
+def get_monthly_revenue_share(sales, year=None, channel=None, store=None, category=None) -> dict:
+    tool = "get_monthly_revenue_share"
+    definition = ("Revenue for each month and its share of THAT YEAR's revenue "
+                  "(denominator = the same year's total in the same scope).")
+    df, scope, err = _scope(sales, year, channel, store, category)
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    m = revenue_by_month(df)
+    value = {}
+    for y, g in m.groupby("Year"):
+        value[y] = {r["Month name"]: {"revenue": float(r["Revenue"]),
+                                      "share_of_year_pct": float(r["Share of year %"])}
+                    for _, r in g.iterrows()}
+    cav = _base_caveats(df)
+    short = [y for y, g in m.groupby("Year") if len(g) < 12]
+    if short:
+        cav.append("These years have fewer than 12 months, so shares are of a partial year: "
+                   + ", ".join(short) + ".")
+    return _result(tool, value, definition, scope, df["Revenue"].notna().sum(), cav)
+
+
+def get_satisfaction_revenue_relationship(sales, store_year, year=None, store=None) -> dict:
+    tool = "get_satisfaction_revenue_relationship"
+    definition = ("Pearson correlation between each physical store's annual revenue and its "
+                  "survey Satisfaction score (0 to 5), one point per store-year.")
+    df, scope, err = _scope(sales, year, None, store, None)
+    scope.pop("channel"); scope.pop("category")
+    if err:
+        return _error(tool, scope, err)
+    if (empty := _empty_check(tool, df, scope, definition)):
+        return empty
+    pairs = satisfaction_vs_revenue(df, store_year)
+    all_sy = df[df["Channel"] != "Website"].groupby(["Store ID", "Year"]).ngroups
+    r, n = correlation(pairs["Satisfaction"], pairs["Revenue"])
+    strength = None
+    if r is not None:
+        a = abs(r)
+        strength = ("very weak or none" if a < 0.1 else "weak" if a < 0.3
+                    else "moderate" if a < 0.5 else "strong")
+        strength += " positive" if r > 0 else " negative" if r < 0 else ""
+    value = {"correlation_r": r, "strength": strength, "store_years_used": n,
+             "average_satisfaction": float(pairs["Satisfaction"].mean()) if n else None}
+    cav = [
+        "Correlation shows association only. It does not show that satisfaction causes "
+        "revenue (or the reverse); store size, location, and market could drive both.",
+        "The Website has no survey scores and is excluded.",
+    ]
+    if all_sy - n > 0:
+        cav.append(f"{all_sy - n} physical store-years have no satisfaction score and were excluded.")
+    if r is None:
+        cav.append(f"Only {n} store-years with scores: too few to calculate a correlation.")
+    elif n < 30:
+        cav.append(f"Small sample ({n} store-years): the correlation is unreliable.")
+    return _result(tool, value, definition, scope, n, cav)
+
+
+def get_data_quality_report(dq: pd.DataFrame, merge_log: pd.DataFrame | None = None) -> dict:
+    tool = "get_data_quality_report"
+    definition = ("Data-quality findings from the loaded files (blank values, duplicates, "
+                  "unmatched keys, out-of-range scores) and the merge checks.")
+    findings = [{"table": r["Table"], "check": r["Check"], "count": int(r["Count"]),
+                 "severity": r["Severity"], "detail": r["Detail"]} for _, r in dq.iterrows()]
+    merges_ok = None
+    if merge_log is not None and not merge_log.empty:
+        merges_ok = bool((merge_log["Status"] != "Error").all())
+    value = {"findings": findings,
+             "errors": sum(f["severity"] == "Error" for f in findings),
+             "warnings": sum(f["severity"] == "Warning" for f in findings),
+             "all_merges_kept_rows_and_revenue": merges_ok}
+    return _result(tool, value, definition, {"data": "All loaded files"}, 0,
+                   ["Findings are reported, not corrected. Some (like the Website having no "
+                    "survey) are structural rather than errors."])
+
+
 # ---------------------------------------------------------------------------
 # Kept from the course starter repo. The app uses the merge checks in
 # data_prep.build_model(), which also validates keys and counts unmatched rows.
