@@ -196,3 +196,9 @@ def test_server_deadline_error_tries_next_model(monkeypatch):
                Resp(text=GOOD)]}, seen)
     _, _, how = ag.answer(Q, CTX, OPTS, api_key="fake", models=["m1", "m2"])
     assert seen[0] == "m1" and how.startswith("Answered by: Gemini (m2)")
+
+
+def test_instructions_cover_causation_both_ways_and_caveats_section():
+    text = ag.system_instruction({})
+    assert "do not claim that one does NOT cause the other" in text
+    assert "**Caveats**" in text and "never put caveats under Findings" in text
