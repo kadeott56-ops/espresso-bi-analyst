@@ -38,7 +38,8 @@ def test_more_question_types():
 
 
 def test_questions_outside_the_data_run_no_tools():
-    for q in ("Who is the manager of the Boulder store?", "What is the average transaction size?",
+    for q in ("Who is the manager of the Boulder store?", "Who manages the Boulder store?",
+              "Who runs the Boulder location?", "What is the average transaction size?",
               "What will revenue be in 2031?", "What's the weather like?"):
         assert tools_for(q) == [], q
 
@@ -107,3 +108,13 @@ def test_answers_change_when_the_data_changes():
     before, _, _ = ag.answer_with_rules(q, CTX, OPTS)
     after, _, _ = ag.answer_with_rules(q, ctx2, OPTS)
     assert "$400" in before and "$1,400" in after
+
+
+def test_ambiguous_store_says_nothing_was_calculated():
+    two = SALES.copy()
+    two.loc[two["Store ID"] == "SH02", "Store"] = "SH02 Orlando, FL"
+    ctx = ag.Context(two, STORE_YEAR, DQ, pd.DataFrame())
+    answer, _, _ = ag.answer_with_rules("How much did Orlando make?", ctx, an.filter_options(two))
+    assert "Scope: not calculated" in answer
+    assert "SH01 Orlando, FL" in answer and "SH02 Orlando, FL" in answer
+    assert "Ask again using one of the valid values" in answer
