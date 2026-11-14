@@ -186,3 +186,13 @@ def test_time_budget_stops_trying(monkeypatch):
     monkeypatch.setattr(ag, "TIME_BUDGET_S", -1)
     _, _, how = ag.answer(Q, CTX, OPTS, api_key="fake", models=["m1"])
     assert "took too long" in how and seen == []
+
+
+def test_server_deadline_error_tries_next_model(monkeypatch):
+    seen = []
+    install_fake(monkeypatch, {
+        "m1": Exception("504 DEADLINE_EXCEEDED. Deadline expired before operation could complete."),
+        "m2": [Resp(calls=[FC("get_total_revenue", {"year": 2025, "channel": "Website"})]),
+               Resp(text=GOOD)]}, seen)
+    _, _, how = ag.answer(Q, CTX, OPTS, api_key="fake", models=["m1", "m2"])
+    assert seen[0] == "m1" and how.startswith("Answered by: Gemini (m2)")
