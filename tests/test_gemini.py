@@ -169,3 +169,20 @@ def test_declarations_only_offer_values_in_the_data():
     assert set(decls) == set(ag.TOOLS)
     store_enum = decls["get_total_revenue"]["parameters"]["properties"]["store"]["enum"]
     assert store_enum == OPTS["stores"]
+
+
+def test_timeout_falls_back_quickly(monkeypatch):
+    seen = []
+    install_fake(monkeypatch, {"m1": TimeoutError("Request timed out"),
+                               "m2": [Resp(text=GOOD)]}, seen)
+    answer, log, how = ag.answer(Q, CTX, OPTS, api_key="fake", models=["m1", "m2"])
+    assert "took too long" in how and seen == ["m1"]      # does not keep trying
+    assert "$400" in answer
+
+
+def test_time_budget_stops_trying(monkeypatch):
+    seen = []
+    install_fake(monkeypatch, {"m1": [Resp(text=GOOD)]}, seen)
+    monkeypatch.setattr(ag, "TIME_BUDGET_S", -1)
+    _, _, how = ag.answer(Q, CTX, OPTS, api_key="fake", models=["m1"])
+    assert "took too long" in how and seen == []
