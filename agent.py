@@ -20,6 +20,7 @@ What the assistant can never do:
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 
 import analytics as an
@@ -576,6 +577,8 @@ def answer_with_rules(question: str, ctx: Context, opts: dict,
 DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 MAX_MODEL_ROUNDS = 3        # rounds of tool calls per question
 MAX_TOOL_CALLS = 6          # total tool calls per question
+GEMINI_TIMEOUT_MS = 25_000  # one request may take at most 25 seconds
+TIME_BUDGET_S = 50          # after 50 seconds in total, stop and use the rules router
 
 
 def tool_declarations(opts: dict) -> list[dict]:
@@ -705,18 +708,17 @@ def answer_with_gemini(question: str, ctx: Context, opts: dict, defaults: dict |
         return _fallback(question, ctx, opts, defaults, "the Gemini package is not installed")
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = _make_client(genai, types, api_key)
     except Exception as exc:
         return _fallback(question, ctx, opts, defaults, f"Gemini could not start: {_short(exc)}")
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction(defaults),
-        tools=[types.Tool(function_declarations=tool_declarations(opts))],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        temperature=0,
-    )
+    config = _make_config(types, defaults, opts)
+    start = time.monotonic()
     last_error = "no model responded"
     for model in (models or DEFAULT_MODELS):
+        if time.monotonic() - start > TIME_BUDGET_S:
+            last_error = "Gemini took too long to respond"
+            break
         log: list[dict] = []
         contents = [types.Content(role="user", parts=[types.Part(text=question)])]
         try:
@@ -726,6 +728,8 @@ def answer_with_gemini(question: str, ctx: Context, opts: dict, defaults: dict |
             while response.function_calls and rounds < MAX_MODEL_ROUNDS \
                     and len(log) < MAX_TOOL_CALLS:
                 rounds += 1
+                if time.monotonic() - start > TIME_BUDGET_S:
+                    raise TimeoutError("TIMEOUT: time budget used up")
                 contents.append(response.candidates[0].content)  # keeps thought signatures
                 parts = []
                 for fc in response.function_calls:
@@ -757,6 +761,39 @@ def answer_with_gemini(question: str, ctx: Context, opts: dict, defaults: dict |
     return _fallback(question, ctx, opts, defaults, f"Gemini unavailable: {last_error}")
 
 
+def _make_client(genai, types, api_key):
+    """Client with a per-request timeout and no automatic retries, so a slow or
+    failing request cannot leave the app spinning. Falls back to simpler
+    settings if this SDK version does not support them."""
+    attempts = [
+        lambda: genai.Client(api_key=api_key, http_options=types.HttpOptions(
+            timeout=GEMINI_TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1))),
+        lambda: genai.Client(api_key=api_key,
+                             http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS)),
+        lambda: genai.Client(api_key=api_key),
+    ]
+    for make in attempts[:-1]:
+        try:
+            return make()
+        except Exception:
+            continue
+    return attempts[-1]()
+
+
+def _make_config(types, defaults, opts):
+    kwargs = dict(
+        system_instruction=system_instruction(defaults),
+        tools=[types.Tool(function_declarations=tool_declarations(opts))],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        temperature=0,
+    )
+    try:   # Gemini 3 models "think" before answering; keep it short for speed.
+        return types.GenerateContentConfig(
+            **kwargs, thinking_config=types.ThinkingConfig(thinking_level="low"))
+    except Exception:
+        return types.GenerateContentConfig(**kwargs)
+
+
 def _function_response_part(types, fc, result):
     try:
         return types.Part.from_function_response(name=fc.name, response={"result": result},
@@ -773,7 +810,10 @@ def _is_retryable(exc) -> bool:
 
 def _short(exc) -> str:
     s = str(exc)
-    for key, msg in (("API_KEY_INVALID", "the API key is invalid"),
+    for key, msg in (("TIMEOUT", "Gemini took too long to respond"),
+                     ("TIMED OUT", "Gemini took too long to respond"),
+                     ("DEADLINE", "Gemini took too long to respond"),
+                     ("API_KEY_INVALID", "the API key is invalid"),
                      ("PERMISSION_DENIED", "the API key does not have access"),
                      ("RESOURCE_EXHAUSTED", "the free quota is used up"),
                      ("429", "the free quota is used up"),
