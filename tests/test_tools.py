@@ -109,3 +109,17 @@ def test_empty_scope_returns_no_value_with_explanation():
     r = an.get_total_revenue(SALES, year=2025, store="Boulder")  # SH02 only sold in 2026
     assert r["value"] is None and "error" not in r
     assert "No sales rows match" in r["caveats"][0]
+
+
+def test_revenue_by_store_ranking():
+    v = an.get_revenue_by_store(SALES)["value"]
+    # SH00 = 100+200+300 = 600 ; SH01 = 50+150 = 200 ; SH02 = 200
+    assert v[0]["store"] == "SH00 Website" and v[0]["revenue"] == 600
+    assert v[0]["share_pct"] == 60 and len(v) == 3
+
+
+def test_top_products():
+    v = an.get_top_products(SALES, n=1)["value"]
+    # P06 = 150+300+200 = 650 ; P01 = 100+200+50 = 350
+    assert v == [{"rank": 1, "product": "P06 Vanilla Bean", "category": "Syrups",
+                  "revenue": 650, "share_pct": 65}]
