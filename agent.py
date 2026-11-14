@@ -144,7 +144,8 @@ PROFIT_WORDS = r"\b(profit\w*|margin\w*|cost\w*|expense\w*|earnings|net income|e
 DECISION_WORDS = r"\b(should|close|closing|shut|open a|open new|invest|expand|recommend\w*|" \
                  r"worth keeping)\b"
 NOT_IN_DATA = {
-    r"\bmanagers?\b|\bphone\b|\baddress\b|\bzip\b|\bpostal\b": "store contact or manager details",
+    r"\bmanag(er|ers|es|ed|ing|ement)\b|\bwho runs\b|\bin charge\b|\bphone\b|\baddress\b|"
+    r"\bzip\b|\bpostal\b|\bcontact\b": "store contact or manager details",
     r"\bemployees?\b|\bstaff\w*\b|\bwages?\b|\bsalar\w*\b|\bpayroll\b": "staffing or wages",
     r"\bprices?\b|\bpricing\b|\bunits?\b|\bquantit\w*\b|\bvolume\b": "prices or units sold",
     r"\bcustomers? (count|numbers?)\b|\bhow many customers\b|\bfoot traffic\b|\bvisits?\b":
@@ -530,6 +531,8 @@ def write_answer(plan: Plan, results: list[dict]) -> str:
             nexts.append("No recommendation is supported by this data. A decision would also "
                          "need store costs and profitability, lease terms, staffing, and local "
                          "market and customer information.")
+        if results and all(r.get("error") for r in results):
+            nexts.append("Ask again using one of the valid values listed above.")
         elif not nexts:
             nexts.append("No recommendation is supported by this data alone; use these figures "
                          "as a starting point for questions about costs and causes.")
@@ -543,7 +546,11 @@ def write_answer(plan: Plan, results: list[dict]) -> str:
             and plan.intent != "profit":
         caveats.append(an.REVENUE_NOT_PROFIT)
 
-    parts = [f"*{scope_line(results, plan.sources)}*",
+    if results and all(r.get("error") for r in results):
+        scope = "Scope: not calculated, because a value in the question did not match the data."
+    else:
+        scope = scope_line(results, plan.sources)
+    parts = [f"*{scope}*",
              _section("Findings", findings),
              _section("Interpretation", interp),
              _section("Caveats", caveats),
