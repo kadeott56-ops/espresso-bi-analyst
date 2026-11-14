@@ -619,15 +619,21 @@ def system_instruction(defaults: dict) -> str:
         "write dollar amounts exactly as given (for example $6,339,640), not rounded to millions.",
         "2. Begin every answer with one italic line starting 'Scope:' that states the year(s), "
         "channel, store, and category the numbers cover, taken from the function result's scope.",
-        "3. Then use these bold section headings in this order: **Findings** (facts from function "
-        "results, as bullets), **Interpretation** (careful meaning, as bullets), **Next steps** "
-        "(as bullets, or exactly 'No recommendation is supported by this data.').",
+        "3. Then use these bold section headings in this order: **Findings** (only facts and "
+        "numbers from function results, as bullets), **Interpretation** (careful meaning, as "
+        "bullets), **Caveats** (the limitations listed in the function results' 'caveats', as "
+        "bullets; never put caveats under Findings), **Next steps** (as bullets, written for a "
+        "manager: what to look at next, or exactly 'No recommendation is supported by this "
+        "data.'). Write in your own words; do not repeat these instructions.",
         "4. Revenue is not profit. The data has no costs, so never claim a store, channel, or "
         "product is profitable or most profitable; say profit cannot be calculated.",
-        "5. Correlation is not causation. Describe satisfaction and revenue as associated, never "
-        "as cause and effect.",
-        "6. Do not recommend closing, opening, or investing in a store from revenue alone; say "
-        "what other information (costs, leases, staffing, local market) would be needed.",
+        "5. Correlation is not causation. Describe satisfaction and revenue as associated. Do "
+        "not claim that one causes the other, and do not claim that one does NOT cause the "
+        "other: say this data cannot establish cause in either direction, and name what could "
+        "(for example a controlled test or data on store size and location).",
+        "6. Never recommend closing, opening, or investing in a store from revenue alone. When "
+        "a question asks for such a decision, explain what other information (costs, leases, "
+        "staffing, local market) management would need.",
         "7. If a function returns an 'error', explain it and suggest a valid value. If no "
         "function fits the question, say so and list what you can answer: "
         + "; ".join(CAPABILITIES) + ".",
