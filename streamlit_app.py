@@ -171,11 +171,35 @@ EXAMPLES = [
 
 with asst_tab:
     st.markdown("#### Ask the analytical assistant")
-    st.caption(
-        "Mode: **rules-based assistant (Option B)**. It matches your question to one of "
-        "the approved analytical functions, runs that function on the currently loaded "
-        "data, and reports only numbers the function returns. It cannot run other code "
-        "or change the data.")
+    # The API key lives in Streamlit Secrets, never in the code or the repository.
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY")
+        model_override = st.secrets.get("GEMINI_MODEL")
+    except Exception:          # no secrets configured (e.g. running locally)
+        api_key, model_override = None, None
+    models = [model_override] + ag.DEFAULT_MODELS if model_override else ag.DEFAULT_MODELS
+    use_llm = False
+    if api_key:
+        use_llm = st.toggle(
+            "Use Gemini (language model)", value=True,
+            help="On: Gemini reads your question, chooses from the approved functions, and "
+                 "explains the results. Off, or if Gemini fails: the rules-based router "
+                 "answers instead.")
+    if use_llm:
+        st.caption(
+            "Mode: **language-model assistant (Option A)**. Gemini chooses among the "
+            "approved analytical functions; the app runs them on the currently loaded data "
+            "and Gemini explains the results. Every dollar amount and percentage in its "
+            "answer is checked against the function results. If Gemini is unavailable, out "
+            "of quota, or fails that check, the rules-based router answers instead. Each "
+            "question is answered on its own, so include all details in each question.")
+    else:
+        st.caption(
+            "Mode: **rules-based assistant (Option B)**. It matches your question to one of "
+            "the approved analytical functions, runs that function on the currently loaded "
+            "data, and reports only numbers the function returns. It cannot run other code "
+            "or change the data."
+            + ("" if api_key else " (No Gemini API key is configured.)"))
     if model.sales is None:
         st.info("Upload the Sales table to use the assistant.")
     else:
@@ -235,12 +259,14 @@ with asst_tab:
                                  disabled=remaining <= 0)
         if question:
             st.session_state.questions_used += 1
-            answer, log, plan = ag.answer_with_rules(question, ctx, opts, defaults)
+            with st.spinner("Calculating..."):
+                answer, log, how = ag.answer(question, ctx, opts, defaults,
+                                             api_key=api_key, models=models, use_llm=use_llm)
             sales_src = result.sources.get("sales", "unknown file")
             st.session_state.chat.append({"role": "user", "content": question})
             st.session_state.chat.append({
                 "role": "assistant", "content": answer, "log": log,
-                "meta": f"Answered by: rules-based router · Data: {sales_src}"})
+                "meta": f"{how} · Data: {sales_src}"})
             st.rerun()
 
 

@@ -565,3 +565,229 @@ def answer_with_rules(question: str, ctx: Context, opts: dict,
     log: list[dict] = []
     results = [run_tool(name, args, ctx, log) for name, args in plan.calls]
     return write_answer(plan, results), log, plan
+
+
+# ---------------------------------------------------------------------------
+# 5. Language-model router (Option A): Gemini chooses tools, our code runs
+#    them, and Gemini explains the results. Falls back to the rules-based
+#    router if there is no key, the API fails, the quota is used up, or the
+#    answer contains a number that is not in any tool result.
+# ---------------------------------------------------------------------------
+DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+MAX_MODEL_ROUNDS = 3        # rounds of tool calls per question
+MAX_TOOL_CALLS = 6          # total tool calls per question
+
+
+def tool_declarations(opts: dict) -> list[dict]:
+    """Describe each registered tool to the model. Allowed values come from
+    the loaded data, so the model can only pick stores, channels, and
+    categories that exist."""
+    years = ", ".join(map(str, opts.get("years", [])))
+    common = {
+        "year": {"type": "integer", "description": f"Calendar year. Available: {years}."},
+        "start_year": {"type": "integer", "description": f"First year to compare. Available: {years}."},
+        "end_year": {"type": "integer", "description": f"Last year to compare. Available: {years}."},
+        "channel": {"type": "string", "enum": list(opts.get("channels", [])),
+                    "description": "Sales channel."},
+        "store": {"type": "string", "enum": list(opts.get("stores", [])),
+                  "description": "Store, as 'ID City, State'. SH00 is the Website."},
+        "category": {"type": "string", "enum": list(opts.get("categories", [])),
+                     "description": "Product category."},
+        "n": {"type": "integer", "description": "How many products to return (1 to 20)."},
+    }
+    decls = []
+    for name, spec in TOOLS.items():
+        d = {"name": name, "description": spec["description"]}
+        props = {p: common[p] for p in spec["params"] if p in common}
+        if props:
+            d["parameters"] = {"type": "object", "properties": props}
+        decls.append(d)
+    return decls
+
+
+def system_instruction(defaults: dict) -> str:
+    lines = [
+        "You are the analytical assistant for E-Presso, a fictional coffee-equipment retailer.",
+        "Rules you must follow:",
+        "1. For any number, call one of the provided functions. Never estimate, remember, or "
+        "calculate numbers yourself. Only state numbers that appear in a function result, and "
+        "write dollar amounts exactly as given (for example $6,339,640), not rounded to millions.",
+        "2. Begin every answer with one italic line starting 'Scope:' that states the year(s), "
+        "channel, store, and category the numbers cover, taken from the function result's scope.",
+        "3. Then use these bold section headings in this order: **Findings** (facts from function "
+        "results, as bullets), **Interpretation** (careful meaning, as bullets), **Next steps** "
+        "(as bullets, or exactly 'No recommendation is supported by this data.').",
+        "4. Revenue is not profit. The data has no costs, so never claim a store, channel, or "
+        "product is profitable or most profitable; say profit cannot be calculated.",
+        "5. Correlation is not causation. Describe satisfaction and revenue as associated, never "
+        "as cause and effect.",
+        "6. Do not recommend closing, opening, or investing in a store from revenue alone; say "
+        "what other information (costs, leases, staffing, local market) would be needed.",
+        "7. If a function returns an 'error', explain it and suggest a valid value. If no "
+        "function fits the question, say so and list what you can answer: "
+        + "; ".join(CAPABILITIES) + ".",
+        "8. Mention important caveats from the function results.",
+    ]
+    if defaults:
+        d = ", ".join(f"{k} = {v}" for k, v in defaults.items())
+        lines.append(f"The user's dashboard sidebar is filtered to: {d}. If the question does "
+                     "not mention that dimension, pass that value to the function and mark it "
+                     "'(from the sidebar filter)' in the Scope line. Values named in the "
+                     "question override the sidebar.")
+    else:
+        lines.append("The dashboard sidebar has no single-value filters, so use only what the "
+                     "question specifies.")
+    return "\n".join(lines)
+
+
+# ---- Number check: every $ amount and % in the answer must match a tool result.
+_MONEY = re.compile(r"\$\s?(-?[\d,]*\.?\d+)\s*(million|billion|thousand|[mkb]\b)?", re.I)
+_PCT = re.compile(r"(-?\d+(?:\.\d+)?)\s?%")
+_MULT = {"million": 1e6, "m": 1e6, "billion": 1e9, "b": 1e9, "thousand": 1e3, "k": 1e3}
+
+
+def _result_numbers(log: list[dict]) -> list[float]:
+    nums: list[float] = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+        elif isinstance(x, (int, float)) and not isinstance(x, bool):
+            nums.append(float(x))
+    for call in log:
+        walk(call["result"].get("value"))
+        walk(call["result"].get("rows_used"))
+    return nums
+
+
+def unsupported_numbers(text: str, log: list[dict]) -> list[str]:
+    """Return dollar amounts and percentages in `text` that do not match any
+    number in the tool results (allowing for the precision they are written
+    with, e.g. '$2.5 million' or '64.5%')."""
+    nums = _result_numbers(log)
+    bad = []
+
+    def ok(value, decimals, mult, extra):
+        tol = 0.5 * 10 ** (-decimals) * mult + extra
+        return any(abs(abs(value) - abs(n)) <= tol for n in nums)
+
+    for m in _MONEY.finditer(text):
+        raw = m.group(1).replace(",", "")
+        dec = len(raw.split(".")[1]) if "." in raw else 0
+        mult = _MULT.get((m.group(2) or "").lower(), 1)
+        if not ok(float(raw) * mult, dec, mult, 1):
+            bad.append(m.group(0).strip())
+    for m in _PCT.finditer(text):
+        raw = m.group(1)
+        dec = len(raw.split(".")[1]) if "." in raw else 0
+        if not ok(float(raw), dec, 1, 0.011):
+            bad.append(m.group(0).strip())
+    return bad
+
+
+def _fallback(question, ctx, opts, defaults, reason):
+    answer, log, _ = answer_with_rules(question, ctx, opts, defaults)
+    return answer, log, f"Answered by: rules-based router ({reason})"
+
+
+def answer_with_gemini(question: str, ctx: Context, opts: dict, defaults: dict | None,
+                       api_key: str, models: list[str] | None = None):
+    """Option A. Returns (answer_markdown, tool_log, meta_line)."""
+    defaults = {k: v for k, v in (defaults or {}).items() if v is not None}
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception:
+        return _fallback(question, ctx, opts, defaults, "the Gemini package is not installed")
+
+    try:
+        client = genai.Client(api_key=api_key)
+    except Exception as exc:
+        return _fallback(question, ctx, opts, defaults, f"Gemini could not start: {_short(exc)}")
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction(defaults),
+        tools=[types.Tool(function_declarations=tool_declarations(opts))],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        temperature=0,
+    )
+    last_error = "no model responded"
+    for model in (models or DEFAULT_MODELS):
+        log: list[dict] = []
+        contents = [types.Content(role="user", parts=[types.Part(text=question)])]
+        try:
+            response = client.models.generate_content(model=model, contents=contents,
+                                                      config=config)
+            rounds = 0
+            while response.function_calls and rounds < MAX_MODEL_ROUNDS \
+                    and len(log) < MAX_TOOL_CALLS:
+                rounds += 1
+                contents.append(response.candidates[0].content)  # keeps thought signatures
+                parts = []
+                for fc in response.function_calls:
+                    if len(log) >= MAX_TOOL_CALLS:
+                        break
+                    result = run_tool(fc.name, dict(fc.args or {}), ctx, log)
+                    parts.append(_function_response_part(types, fc, result))
+                contents.append(types.Content(role="user", parts=parts))
+                response = client.models.generate_content(model=model, contents=contents,
+                                                          config=config)
+            text = (response.text or "").strip()
+        except Exception as exc:
+            last_error = _short(exc)
+            if _is_retryable(exc):
+                continue           # model missing or its quota is used up: try the next one
+            return _fallback(question, ctx, opts, defaults, f"Gemini error: {last_error}")
+
+        if not text:
+            return _fallback(question, ctx, opts, defaults, "Gemini returned an empty answer")
+        bad = unsupported_numbers(text, log)
+        if bad:
+            return _fallback(question, ctx, opts, defaults,
+                             "Gemini's draft contained numbers not found in any tool result: "
+                             + ", ".join(bad[:5]))
+        if not text.lstrip("*_ ").lower().startswith("scope"):
+            results = [c["result"] for c in log]
+            text = f"*{scope_line(results, {})}*\n\n" + text
+        return text, log, f"Answered by: Gemini ({model}) choosing approved functions"
+    return _fallback(question, ctx, opts, defaults, f"Gemini unavailable: {last_error}")
+
+
+def _function_response_part(types, fc, result):
+    try:
+        return types.Part.from_function_response(name=fc.name, response={"result": result},
+                                                 id=getattr(fc, "id", None))
+    except TypeError:  # older SDK without the id argument
+        return types.Part.from_function_response(name=fc.name, response={"result": result})
+
+
+def _is_retryable(exc) -> bool:
+    s = str(exc).upper()
+    return any(k in s for k in ("404", "NOT_FOUND", "NOT FOUND", "429", "RESOURCE_EXHAUSTED",
+                                "QUOTA", "UNAVAILABLE", "503"))
+
+
+def _short(exc) -> str:
+    s = str(exc)
+    for key, msg in (("API_KEY_INVALID", "the API key is invalid"),
+                     ("PERMISSION_DENIED", "the API key does not have access"),
+                     ("RESOURCE_EXHAUSTED", "the free quota is used up"),
+                     ("429", "the free quota is used up"),
+                     ("NOT_FOUND", "the model is not available")):
+        if key in s.upper():
+            return msg
+    return (s[:120] + "...") if len(s) > 120 else s
+
+
+def answer(question: str, ctx: Context, opts: dict, defaults: dict | None = None,
+           api_key: str | None = None, models: list[str] | None = None,
+           use_llm: bool = True):
+    """Entry point used by the app: Gemini when available, rules otherwise."""
+    if use_llm and api_key:
+        return answer_with_gemini(question, ctx, opts, defaults, api_key, models)
+    reason = "Gemini turned off" if api_key else "no Gemini API key configured"
+    return _fallback(question, ctx, opts, defaults, reason)
