@@ -185,6 +185,18 @@ with asst_tab:
             help="On: Gemini reads your question, chooses from the approved functions, and "
                  "explains the results. Off, or if Gemini fails: the rules-based router "
                  "answers instead.")
+    if api_key:
+        with st.expander("Gemini connection check"):
+            st.caption("Sends a tiny test request to each model and reports how long it "
+                       "took and any error. Each check uses a little of the free quota.")
+            c_a, c_b = st.columns(2)
+            run_plain = c_a.button("Check connection")
+            run_tools = c_b.button("Check function calling",
+                                   disabled=model.sales is None)
+            if run_plain or run_tools:
+                with st.spinner("Contacting Gemini..."):
+                    rows = ag.check_gemini(api_key, models, opts, with_tools=run_tools)
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     if use_llm:
         st.caption(
             "Mode: **language-model assistant (Option A)**. Gemini chooses among the "

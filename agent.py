@@ -577,8 +577,8 @@ def answer_with_rules(question: str, ctx: Context, opts: dict,
 DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 MAX_MODEL_ROUNDS = 3        # rounds of tool calls per question
 MAX_TOOL_CALLS = 6          # total tool calls per question
-GEMINI_TIMEOUT_MS = 25_000  # one request may take at most 25 seconds
-TIME_BUDGET_S = 50          # after 50 seconds in total, stop and use the rules router
+GEMINI_TIMEOUT_MS = 30_000  # one request may take at most 30 seconds
+TIME_BUDGET_S = 60          # after 60 seconds in total, stop and use the rules router
 
 
 def tool_declarations(opts: dict) -> list[dict]:
@@ -743,6 +743,7 @@ def answer_with_gemini(question: str, ctx: Context, opts: dict, defaults: dict |
             text = (response.text or "").strip()
         except Exception as exc:
             last_error = _short(exc)
+            print(f"[gemini] {model}: {type(exc).__name__}: {_scrub(exc, api_key)}")  # app log
             if _is_retryable(exc):
                 continue           # model missing or its quota is used up: try the next one
             return _fallback(question, ctx, opts, defaults, f"Gemini error: {last_error}")
@@ -821,6 +822,52 @@ def _short(exc) -> str:
         if key in s.upper():
             return msg
     return (s[:120] + "...") if len(s) > 120 else s
+
+
+def check_gemini(api_key: str, models: list[str] | None = None, opts: dict | None = None,
+                 with_tools: bool = False) -> list[dict]:
+    """Diagnostics: send a tiny request to each model and report the time taken
+    and the exact error. The API key is removed from any error text."""
+    rows = []
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as exc:
+        return [{"model": "-", "ok": False, "seconds": 0,
+                 "message": f"google-genai package not importable: {exc}"}]
+    try:
+        client = _make_client(genai, types, api_key)
+    except Exception as exc:
+        return [{"model": "-", "ok": False, "seconds": 0, "message": _scrub(exc, api_key)}]
+    for model in (models or DEFAULT_MODELS):
+        t0 = time.monotonic()
+        try:
+            if with_tools:
+                cfg = _make_config(types, {}, opts or {})
+                prompt = "How much total revenue did E-Presso make? Use a function."
+            else:
+                cfg = None
+                prompt = "Reply with the single word OK."
+            resp = client.models.generate_content(
+                model=model, contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                config=cfg)
+            calls = [fc.name for fc in (resp.function_calls or [])]
+            msg = f"Requested function(s): {', '.join(calls)}" if calls else \
+                f"Replied: {(resp.text or '').strip()[:60]}"
+            rows.append({"model": model, "ok": True,
+                         "seconds": round(time.monotonic() - t0, 1), "message": msg})
+        except Exception as exc:
+            rows.append({"model": model, "ok": False,
+                         "seconds": round(time.monotonic() - t0, 1),
+                         "message": f"{type(exc).__name__}: {_scrub(exc, api_key)}"})
+    return rows
+
+
+def _scrub(exc, api_key) -> str:
+    s = str(exc)
+    if api_key:
+        s = s.replace(api_key, "[key hidden]")
+    return s[:300]
 
 
 def answer(question: str, ctx: Context, opts: dict, defaults: dict | None = None,
