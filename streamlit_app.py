@@ -367,7 +367,7 @@ with dash_tab:
             fig.update_layout(yaxis={"categoryorder": "total ascending"})
             # Readable hover box (the default would show the label field as "text=").
             fig.update_traces(hovertemplate="<b>%{y}</b><br>Revenue: $%{x:,.0f}"
-                                            "<br>Share of scope: %{text}<extra></extra>")
+                                            "<br>Share of revenue: %{text}<extra></extra>")
             st.plotly_chart(dollar_axis(fig, "x"), use_container_width=True)
 
         # ---- Chart 4: top products ----
